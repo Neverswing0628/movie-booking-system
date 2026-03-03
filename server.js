@@ -218,20 +218,27 @@ app.get('/api/seats/:showtimeId', async (req, res) => {
         
         const query = `
             SELECT 
-                st_row_nm as "rowName",
-                st_no as "seatNumber",
-                st_typ as type,
-                st_avlbl_yn as available,
-                rsv_id as "reservationId"
-            FROM seat
-            WHERE scr_id = (
+                s.seat_id,
+                s.seat_row_nm as "rowName",
+                s.seat_no as "seatNumber",
+                s.seat_typ as type,
+                CASE 
+                    WHEN r.resv_id IS NOT NULL AND r.resv_stat = '2' THEN '2'
+                    ELSE s.seat_stat
+                END as available,
+                r.resv_id as "reservationId"
+            FROM seat s
+            LEFT JOIN resv r ON s.seat_id = r.seat_id 
+                AND r.sht_id = $1
+                AND r.resv_stat = '2'
+            WHERE s.scr_id = (
                 SELECT scr_id FROM shtm WHERE sht_id = $1
             )
-            ORDER BY st_row_nm, st_no
+            ORDER BY s.seat_row_nm, s.seat_no
         `;
         
         const result = await pool.query(query, [showtimeId]);
-        console.log(`✅ 좌석 ${result.rows.length}개 조회 성공`);
+        console.log(`✅ 좌석 ${result.rows.length}개 조회 (예약 상태 반영)`);
         res.json(result.rows);
     } catch (error) {
         console.error('❌ 좌석 정보 조회 실패:', error);
@@ -251,11 +258,11 @@ app.post('/api/auth/login', async (req, res) => {
         // 회원 정보 조회
         const userQuery = `
             SELECT 
-                cust_id as id,
+                mbr_id as id,
                 mbr_email as email,
                 mbr_nm as name,
                 mbr_pnt as points,
-                mbr_grd as membership,
+                mbr_mbrshp_lvl as membership,
                 mbr_pwd as password
             FROM cust
             WHERE mbr_email = $1 AND mbr_stat = 'ACTIVE'
@@ -304,7 +311,7 @@ app.post('/api/auth/login', async (req, res) => {
         
         // 마지막 로그인 시간 업데이트
         await pool.query(
-            `UPDATE cust SET mbr_lst_login_dtm = NOW() WHERE cust_id = $1`,
+            `UPDATE cust SET mbr_last_login = NOW() WHERE mbr_id = $1`,
             [user.id]
         );
         
@@ -434,6 +441,350 @@ app.get('/api/inquiries/:mbrId', async (req, res) => {
     }
 });
 
+// ========================================
+// 포인트 API
+// ========================================
+
+// 회원 포인트 조회
+app.get('/api/members/:id/points', async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        const query = `
+            SELECT 
+                mbr_id as id,
+                mbr_pnt as points,
+                mbr_mbrshp_lvl as membership
+            FROM cust
+            WHERE mbr_id = $1
+        `;
+        
+        const result = await pool.query(query, [id]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ 
+                success: false,
+                message: '회원을 찾을 수 없습니다.' 
+            });
+        }
+        
+        console.log(`✅ 회원 ${id} 포인트 조회: ${result.rows[0].points}P`);
+        res.json(result.rows[0]);
+        
+    } catch (error) {
+        console.error('❌ 포인트 조회 실패:', error);
+        res.status(500).json({ 
+            success: false,
+            message: '포인트를 불러오는데 실패했습니다.' 
+        });
+    }
+});
+
+// 포인트 사용
+app.post('/api/points/use', async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+        const { mbrId, amount, orderId } = req.body;
+        
+        await client.query('BEGIN');
+        
+        // 현재 포인트 조회 (FOR UPDATE로 잠금)
+        const pointQuery = `
+            SELECT mbr_pnt as points
+            FROM cust
+            WHERE mbr_id = $1
+            FOR UPDATE
+        `;
+        
+        const pointResult = await client.query(pointQuery, [mbrId]);
+        
+        if (pointResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ 
+                success: false,
+                message: '회원을 찾을 수 없습니다.' 
+            });
+        }
+        
+        const currentPoints = pointResult.rows[0].points;
+        
+        // 포인트 부족 확인
+        if (currentPoints < amount) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ 
+                success: false,
+                message: '포인트가 부족합니다.',
+                currentPoints: currentPoints,
+                requestedAmount: amount
+            });
+        }
+        
+        // 포인트 차감
+        const updateQuery = `
+            UPDATE cust
+            SET mbr_pnt = mbr_pnt - $1
+            WHERE mbr_id = $2
+            RETURNING mbr_pnt as points
+        `;
+        
+        const updateResult = await client.query(updateQuery, [amount, mbrId]);
+        
+        await client.query('COMMIT');
+        
+        console.log(`✅ 포인트 사용: 회원 ${mbrId}, ${amount}P 차감, 잔액 ${updateResult.rows[0].points}P`);
+        
+        res.json({
+            success: true,
+            message: '포인트가 사용되었습니다.',
+            usedPoints: amount,
+            remainingPoints: updateResult.rows[0].points
+        });
+        
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('❌ 포인트 사용 실패:', error);
+        res.status(500).json({ 
+            success: false,
+            message: '포인트 사용 중 오류가 발생했습니다.' 
+        });
+    } finally {
+        client.release();
+    }
+});
+
+// 포인트 적립
+app.post('/api/points/earn', async (req, res) => {
+    try {
+        const { mbrId, amount, reason } = req.body;
+        
+        const query = `
+            UPDATE cust
+            SET mbr_pnt = mbr_pnt + $1
+            WHERE mbr_id = $2
+            RETURNING mbr_pnt as points
+        `;
+        
+        const result = await pool.query(query, [amount, mbrId]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ 
+                success: false,
+                message: '회원을 찾을 수 없습니다.' 
+            });
+        }
+        
+        console.log(`✅ 포인트 적립: 회원 ${mbrId}, ${amount}P 적립, 잔액 ${result.rows[0].points}P`);
+        
+        res.json({
+            success: true,
+            message: '포인트가 적립되었습니다.',
+            earnedPoints: amount,
+            totalPoints: result.rows[0].points
+        });
+        
+    } catch (error) {
+        console.error('❌ 포인트 적립 실패:', error);
+        res.status(500).json({ 
+            success: false,
+            message: '포인트 적립 중 오류가 발생했습니다.' 
+        });
+    }
+});
+
+// ========================================
+// 쿠폰 API
+// ========================================
+
+// 회원 쿠폰 조회 (사용 가능한 쿠폰만)
+app.get('/api/members/:id/coupons', async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        const query = `
+            SELECT 
+                mc.mbr_cpn_id as id,
+                mc.cpn_id as "couponId",
+                c.cpn_cd as code,
+                c.cpn_nm as name,
+                c.cpn_dc_amt as discount,
+                c.cpn_min_amt as "minAmount",
+                c.cpn_end_dt as "expiryDate",
+                c.cpn_use_cond as condition,
+                mc.mbr_cpn_iss_dtm as "issuedAt"
+            FROM mbr_cpn mc
+            JOIN cpn c ON mc.cpn_id = c.cpn_id
+            WHERE mc.mbr_id = $1
+              AND mc.mbr_cpn_use_yn = '0'
+              AND c.cpn_stat = '1'
+              AND c.cpn_end_dt >= CURRENT_DATE
+            ORDER BY c.cpn_dc_amt DESC
+        `;
+        
+        const result = await pool.query(query, [id]);
+        
+        console.log(`✅ 회원 ${id} 사용 가능한 쿠폰 ${result.rows.length}개 조회`);
+        res.json(result.rows);
+        
+    } catch (error) {
+        console.error('❌ 쿠폰 조회 실패:', error);
+        res.status(500).json({ 
+            success: false,
+            message: '쿠폰을 불러오는데 실패했습니다.' 
+        });
+    }
+});
+
+// 쿠폰 사용
+app.post('/api/coupons/use', async (req, res) => {
+    const client = await pool.connect();
+    
+    try {
+        const { mbrCpnId, reservationId } = req.body;
+        
+        await client.query('BEGIN');
+        
+        // 쿠폰 정보 조회 (FOR UPDATE로 잠금)
+        const couponQuery = `
+            SELECT 
+                mc.mbr_cpn_id,
+                mc.mbr_id,
+                mc.mbr_cpn_use_yn,
+                c.cpn_dc_amt as discount,
+                c.cpn_min_amt as "minAmount",
+                c.cpn_nm as name
+            FROM mbr_cpn mc
+            JOIN cpn c ON mc.cpn_id = c.cpn_id
+            WHERE mc.mbr_cpn_id = $1
+            FOR UPDATE
+        `;
+        
+        const couponResult = await client.query(couponQuery, [mbrCpnId]);
+        
+        if (couponResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ 
+                success: false,
+                message: '쿠폰을 찾을 수 없습니다.' 
+            });
+        }
+        
+        const coupon = couponResult.rows[0];
+        
+        // 이미 사용된 쿠폰 확인
+        if (coupon.mbr_cpn_use_yn === '1') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ 
+                success: false,
+                message: '이미 사용된 쿠폰입니다.' 
+            });
+        }
+        
+        // 쿠폰 사용 처리
+        const updateQuery = `
+            UPDATE mbr_cpn
+            SET mbr_cpn_use_yn = '1',
+                mbr_cpn_use_dtm = NOW(),
+                rsv_id = $1
+            WHERE mbr_cpn_id = $2
+            RETURNING mbr_cpn_use_dtm as "usedAt"
+        `;
+        
+        const updateResult = await client.query(updateQuery, [reservationId, mbrCpnId]);
+        
+        await client.query('COMMIT');
+        
+        console.log(`✅ 쿠폰 사용: 회원 ${coupon.mbr_id}, ${coupon.name} (${coupon.discount}원 할인)`);
+        
+        res.json({
+            success: true,
+            message: '쿠폰이 사용되었습니다.',
+            discount: coupon.discount,
+            usedAt: updateResult.rows[0].usedAt
+        });
+        
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('❌ 쿠폰 사용 실패:', error);
+        res.status(500).json({ 
+            success: false,
+            message: '쿠폰 사용 중 오류가 발생했습니다.' 
+        });
+    } finally {
+        client.release();
+    }
+});
+
+// 쿠폰 발급 (관리자용)
+app.post('/api/coupons/issue', async (req, res) => {
+    try {
+        const { mbrId, couponCode } = req.body;
+        
+        // 쿠폰 조회
+        const cpnQuery = `
+            SELECT cpn_id, cpn_nm, cpn_dc_amt
+            FROM cpn
+            WHERE cpn_cd = $1 AND cpn_stat = '1'
+        `;
+        
+        const cpnResult = await pool.query(cpnQuery, [couponCode]);
+        
+        if (cpnResult.rows.length === 0) {
+            return res.status(404).json({ 
+                success: false,
+                message: '유효하지 않은 쿠폰 코드입니다.' 
+            });
+        }
+        
+        const cpn = cpnResult.rows[0];
+        
+        // 중복 발급 확인
+        const dupQuery = `
+            SELECT mbr_cpn_id
+            FROM mbr_cpn
+            WHERE mbr_id = $1 AND cpn_id = $2 AND mbr_cpn_use_yn = '0'
+        `;
+        
+        const dupResult = await pool.query(dupQuery, [mbrId, cpn.cpn_id]);
+        
+        if (dupResult.rows.length > 0) {
+            return res.status(400).json({ 
+                success: false,
+                message: '이미 보유한 쿠폰입니다.' 
+            });
+        }
+        
+        // 쿠폰 발급
+        const issueQuery = `
+            INSERT INTO mbr_cpn (mbr_id, cpn_id, mbr_cpn_use_yn)
+            VALUES ($1, $2, '0')
+            RETURNING mbr_cpn_id as id, mbr_cpn_iss_dtm as "issuedAt"
+        `;
+        
+        const issueResult = await pool.query(issueQuery, [mbrId, cpn.cpn_id]);
+        
+        console.log(`✅ 쿠폰 발급: 회원 ${mbrId}, ${cpn.cpn_nm}`);
+        
+        res.json({
+            success: true,
+            message: '쿠폰이 발급되었습니다.',
+            coupon: {
+                id: issueResult.rows[0].id,
+                name: cpn.cpn_nm,
+                discount: cpn.cpn_dc_amt,
+                issuedAt: issueResult.rows[0].issuedAt
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ 쿠폰 발급 실패:', error);
+        res.status(500).json({ 
+            success: false,
+            message: '쿠폰 발급 중 오류가 발생했습니다.' 
+        });
+    }
+});
+
 // 영화평 조회
 app.get('/api/reviews/:movieId', async (req, res) => {
     try {
@@ -505,7 +856,7 @@ app.get('/api/reservations/:memberId', async (req, res) => {
                 m.mv_ttl as "movieTitle",
                 t.tht_nm as "theaterName",
                 s.sht_shw_strt_dt as "showtime"
-            FROM rsv r
+            FROM rsrv r
             LEFT JOIN shtm s ON r.sht_id = s.sht_id
             LEFT JOIN mv m ON s.mv_id = m.mv_id
             LEFT JOIN thtr t ON s.tht_id = t.tht_id

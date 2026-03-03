@@ -922,20 +922,7 @@
                 
                 <!-- 쿠폰함 -->
                 <div id="mypageCoupons" class="tab-content" style="display: none;">
-                    <div style="display: grid; gap: 15px; padding: 20px 0;">
-                        <div style="border: 2px dashed var(--border-color); padding: 20px; border-radius: 8px; text-align: center;">
-                            <div style="font-size: 24px; font-weight: bold; color: #ffc107; margin-bottom: 8px;">1,000원 할인</div>
-                            <div style="color: #666; font-size: 14px;">사용 가능</div>
-                        </div>
-                        <div style="border: 2px dashed var(--border-color); padding: 20px; border-radius: 8px; text-align: center;">
-                            <div style="font-size: 24px; font-weight: bold; color: #ffc107; margin-bottom: 8px;">2,000원 할인</div>
-                            <div style="color: #666; font-size: 14px;">사용 가능</div>
-                        </div>
-                        <div style="border: 2px dashed var(--border-color); padding: 20px; border-radius: 8px; text-align: center;">
-                            <div style="font-size: 24px; font-weight: bold; color: #ffc107; margin-bottom: 8px;">10% 할인</div>
-                            <div style="color: #666; font-size: 14px;">사용 가능</div>
-                        </div>
-                    </div>
+                    <!-- 동적으로 로드됨 -->
                 </div>
             </div>
         </section>
@@ -1089,6 +1076,8 @@
         let selectedShowtime = null; // { id, price }
         let selectedSeats = [];
         let selectedPaymentMethod = null;
+        let availableCoupons = [];  // 사용 가능한 쿠폰 목록
+        let selectedCoupon = null;   // 선택된 쿠폰
 
         // ========== 리뷰 데이터 (엑셀에서 추출) ==========
         const REVIEWS_DATA = [
@@ -1875,13 +1864,27 @@
 
             if (!couponValue) {
                 paymentData.couponDiscount = 0;
-            } else if (couponValue === '10') {
-                // 10% 할인
-                const baseAmount = paymentData.originalAmount - paymentData.pointDiscount;
-                paymentData.couponDiscount = Math.floor(baseAmount * 0.1);
+                selectedCoupon = null;
             } else {
-                // 정액 할인
-                paymentData.couponDiscount = parseInt(couponValue);
+                // JSON 파싱하여 쿠폰 정보 가져오기
+                try {
+                    selectedCoupon = JSON.parse(couponValue);
+                    
+                    // 최소 금액 체크
+                    const baseAmount = paymentData.originalAmount - paymentData.pointDiscount;
+                    if (baseAmount < selectedCoupon.minAmount) {
+                        alert(`이 쿠폰은 ${selectedCoupon.minAmount.toLocaleString()}원 이상 결제 시 사용 가능합니다.`);
+                        couponSelect.value = '';
+                        selectedCoupon = null;
+                        paymentData.couponDiscount = 0;
+                    } else {
+                        paymentData.couponDiscount = selectedCoupon.discount;
+                    }
+                } catch (e) {
+                    console.error('쿠폰 정보 파싱 실패:', e);
+                    paymentData.couponDiscount = 0;
+                    selectedCoupon = null;
+                }
             }
 
             updatePaymentAmount();
@@ -1901,6 +1904,52 @@
             document.getElementById('pointDiscount').textContent = '-' + paymentData.pointDiscount.toLocaleString() + '원';
             document.getElementById('couponDiscount').textContent = '-' + paymentData.couponDiscount.toLocaleString() + '원';
             document.getElementById('finalAmount').textContent = paymentData.finalAmount.toLocaleString() + '원';
+        }
+
+        // 쿠폰 목록 로드
+        async function loadAvailableCoupons() {
+            if (!currentUser) return;
+            
+            try {
+                const response = await fetch(`${API_BASE_URL}/members/${currentUser.id}/coupons`);
+                if (response.ok) {
+                    availableCoupons = await response.json();
+                    console.log(`✅ 쿠폰 ${availableCoupons.length}개 로드`);
+                    updateCouponSelect();
+                }
+            } catch (error) {
+                console.error('❌ 쿠폰 로드 실패:', error);
+                availableCoupons = [];
+            }
+        }
+
+        // 쿠폰 select 옵션 업데이트
+        function updateCouponSelect() {
+            const couponSelect = document.getElementById('couponSelect');
+            if (!couponSelect) return;
+            
+            // 기존 옵션 제거
+            couponSelect.innerHTML = '<option value="">쿠폰을 선택하세요</option>';
+            
+            // DB에서 가져온 쿠폰 옵션 추가
+            availableCoupons.forEach(coupon => {
+                const option = document.createElement('option');
+                option.value = JSON.stringify(coupon);
+                option.textContent = `${coupon.name} (${coupon.discount.toLocaleString()}원 할인)`;
+                
+                if (coupon.minAmount > 0) {
+                    option.textContent += ` - ${coupon.minAmount.toLocaleString()}원 이상`;
+                }
+                
+                couponSelect.appendChild(option);
+            });
+            
+            if (availableCoupons.length === 0) {
+                couponSelect.innerHTML = '<option value="">사용 가능한 쿠폰이 없습니다</option>';
+                couponSelect.disabled = true;
+            } else {
+                couponSelect.disabled = false;
+            }
         }
 
         function selectPaymentMethod(method) {
@@ -1981,34 +2030,75 @@
             reservations.unshift(newReservation); // 최신순
             localStorage.setItem(`reservations_${currentUser.id}`, JSON.stringify(reservations));
 
-            // 포인트 사용 내역 저장
+            // 💰 포인트 사용 (DB API 호출)
             if (paymentData.pointDiscount > 0) {
-                const pointHistory = JSON.parse(localStorage.getItem(`points_${currentUser.id}`) || '[]');
-                pointHistory.unshift({
-                    description: `${movieTitle} 예매 (${reservationNo})`,
-                    amount: -paymentData.pointDiscount,
-                    date: new Date().toLocaleString('ko-KR'),
-                    type: 'use'
-                });
-                localStorage.setItem(`points_${currentUser.id}`, JSON.stringify(pointHistory));
-                
-                // 포인트 차감
-                currentUser.points -= paymentData.pointDiscount;
+                try {
+                    const usePointResponse = await fetch(`${API_BASE_URL}/points/use`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            mbrId: currentUser.id,
+                            amount: paymentData.pointDiscount,
+                            orderId: reservationNo
+                        })
+                    });
+                    
+                    if (usePointResponse.ok) {
+                        const useResult = await usePointResponse.json();
+                        currentUser.points = useResult.remainingPoints;
+                        console.log(`✅ 포인트 사용: ${paymentData.pointDiscount}P, 잔액: ${useResult.remainingPoints}P`);
+                    }
+                } catch (error) {
+                    console.error('❌ 포인트 사용 API 실패:', error);
+                }
             }
 
-            // 결제 완료 포인트 적립 (결제 금액의 1%)
+            // 💰 포인트 적립 (결제 금액의 1%, DB API 호출)
             const earnedPoints = Math.floor(paymentData.finalAmount * 0.01);
             if (earnedPoints > 0) {
-                const pointHistory = JSON.parse(localStorage.getItem(`points_${currentUser.id}`) || '[]');
-                pointHistory.unshift({
-                    description: `${movieTitle} 예매 적립`,
-                    amount: earnedPoints,
-                    date: new Date().toLocaleString('ko-KR'),
-                    type: 'earn'
-                });
-                localStorage.setItem(`points_${currentUser.id}`, JSON.stringify(pointHistory));
-                
-                currentUser.points += earnedPoints;
+                try {
+                    const earnPointResponse = await fetch(`${API_BASE_URL}/points/earn`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            mbrId: currentUser.id,
+                            amount: earnedPoints,
+                            reason: `${movieTitle} 예매 적립`
+                        })
+                    });
+                    
+                    if (earnPointResponse.ok) {
+                        const earnResult = await earnPointResponse.json();
+                        currentUser.points = earnResult.totalPoints;
+                        console.log(`✅ 포인트 적립: ${earnedPoints}P, 총 잔액: ${earnResult.totalPoints}P`);
+                    }
+                } catch (error) {
+                    console.error('❌ 포인트 적립 API 실패:', error);
+                }
+            }
+
+            // 🎫 쿠폰 사용 (DB API 호출)
+            if (selectedCoupon && paymentData.couponDiscount > 0) {
+                try {
+                    const useCouponResponse = await fetch(`${API_BASE_URL}/coupons/use`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            mbrCpnId: selectedCoupon.id,
+                            reservationId: apiReservationNo
+                        })
+                    });
+                    
+                    if (useCouponResponse.ok) {
+                        const useCouponResult = await useCouponResponse.json();
+                        console.log(`✅ 쿠폰 사용: ${selectedCoupon.name}, ${useCouponResult.discount}원 할인`);
+                        
+                        // 사용한 쿠폰은 목록에서 제거
+                        availableCoupons = availableCoupons.filter(c => c.id !== selectedCoupon.id);
+                    }
+                } catch (error) {
+                    console.error('❌ 쿠폰 사용 API 실패:', error);
+                }
             }
 
             // UI 업데이트
@@ -2234,6 +2324,7 @@
                 loadInquiryHistory();
             } else if (tabName === 'coupons') {
                 document.getElementById('mypageCoupons').style.display = 'block';
+                loadMypageCoupons();
             }
         }
 
@@ -2386,6 +2477,84 @@
             }
         }
 
+        // 마이페이지 쿠폰함 로드
+        async function loadMypageCoupons() {
+            const couponsContent = document.getElementById('mypageCoupons');
+            if (!couponsContent || !currentUser) return;
+            
+            try {
+                const response = await fetch(`${API_BASE_URL}/members/${currentUser.id}/coupons`);
+                
+                if (response.ok) {
+                    const coupons = await response.json();
+                    
+                    if (coupons.length === 0) {
+                        couponsContent.innerHTML = `
+                            <div style="padding: 60px 20px; text-align: center; color: #999;">
+                                <div style="font-size: 48px; margin-bottom: 16px;">🎫</div>
+                                <div style="font-size: 16px;">보유하신 쿠폰이 없습니다</div>
+                            </div>
+                        `;
+                        return;
+                    }
+                    
+                    let html = '<div style="display: grid; gap: 15px; padding: 20px 0;">';
+                    
+                    coupons.forEach(coupon => {
+                        const expiryDate = new Date(coupon.expiryDate);
+                        const today = new Date();
+                        const daysLeft = Math.ceil((expiryDate - today) / (1000 * 60 * 60 * 24));
+                        
+                        let statusColor = '#28a745';
+                        let statusText = '사용 가능';
+                        
+                        if (daysLeft <= 7) {
+                            statusColor = '#ffc107';
+                            statusText = `${daysLeft}일 남음`;
+                        }
+                        
+                        html += `
+                            <div style="border: 2px dashed ${statusColor}; padding: 20px; border-radius: 8px; background: #f8f9fa;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                                    <div style="font-size: 20px; font-weight: bold; color: ${statusColor};">
+                                        ${coupon.discount.toLocaleString()}원 할인
+                                    </div>
+                                    <div style="background: ${statusColor}; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px;">
+                                        ${statusText}
+                                    </div>
+                                </div>
+                                <div style="font-size: 16px; margin-bottom: 8px; font-weight: 500;">
+                                    ${coupon.name}
+                                </div>
+                                <div style="color: #666; font-size: 14px; margin-bottom: 4px;">
+                                    ${coupon.minAmount > 0 ? `${coupon.minAmount.toLocaleString()}원 이상 결제 시 사용` : '제한 없음'}
+                                </div>
+                                <div style="color: #999; font-size: 13px;">
+                                    ${expiryDate.toLocaleDateString()} 까지
+                                </div>
+                                ${coupon.condition ? `
+                                    <div style="margin-top: 8px; padding: 8px; background: white; border-radius: 4px; font-size: 12px; color: #666;">
+                                        💡 ${coupon.condition}
+                                    </div>
+                                ` : ''}
+                            </div>
+                        `;
+                    });
+                    
+                    html += '</div>';
+                    couponsContent.innerHTML = html;
+                    
+                    console.log(`✅ 쿠폰 ${coupons.length}개 표시`);
+                    
+                } else {
+                    couponsContent.innerHTML = '<div style="padding: 40px; text-align: center; color: #999;">쿠폰 조회 실패</div>';
+                }
+            } catch (error) {
+                console.error('❌ 쿠폰 조회 실패:', error);
+                couponsContent.innerHTML = '<div style="padding: 40px; text-align: center; color: #999;">쿠폰 조회 중 오류가 발생했습니다</div>';
+            }
+        }
+
         // ========== 로그인/회원가입 ==========
         function showLoginModal() {
             document.getElementById('loginModal').classList.add('active');
@@ -2424,6 +2593,9 @@
                     
                     // 세션에 저장 (새로고침 시 유지)
                     sessionStorage.setItem('currentUser', JSON.stringify(currentUser));
+                    
+                    // 쿠폰 로드
+                    await loadAvailableCoupons();
                     
                     updateLoginUI();
                     closeModal('loginModal');
@@ -2482,6 +2654,10 @@
                 try {
                     currentUser = JSON.parse(savedUser);
                     updateLoginUI();
+                    
+                    // 쿠폰 로드
+                    loadAvailableCoupons();
+                    
                     console.log('✅ 세션에서 로그인 정보 복원:', currentUser);
                 } catch (error) {
                     console.error('❌ 세션 복원 실패:', error);
@@ -2514,6 +2690,8 @@
                 loadTheaters();
             } else if (sectionId === 'mypage') {
                 loadMypage();
+            } else if (sectionId === 'payment') {
+                loadAvailableCoupons();
             }
             
             // 스크롤 최상단으로
